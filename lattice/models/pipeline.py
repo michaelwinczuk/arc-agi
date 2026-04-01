@@ -26,6 +26,7 @@ from .grid_decoder import SlotDecoder
 from .type_classifier import TransformationClassifier
 from .type_lattice import TypeLattice, MicroOpType
 from .library import TestTimeLibrary, LibraryEntry
+from .rule_engine import RuleEngine
 
 
 class LatticeSolver(nn.Module):
@@ -76,6 +77,9 @@ class LatticeSolver(nn.Module):
         # Test-time library (not a nn.Module, lives outside gradient)
         self.library = TestTimeLibrary(d_vsa=d_vsa)
 
+        # Rule engine: try deterministic rules first (<1ms)
+        self.rule_engine = RuleEngine()
+
         # VSA ops
         self.vsa_ops = VSAOperations()
 
@@ -119,6 +123,11 @@ class LatticeSolver(nn.Module):
         Returns:
             List of predicted output grids, one per test input
         """
+        # --- Try deterministic rules first (<1ms) ---
+        rule_result = self.rule_engine.try_solve(task)
+        if rule_result is not None:
+            return rule_result
+
         # --- Encode all demo pairs ---
         demo_deltas = []
         demo_input_vsas = []
