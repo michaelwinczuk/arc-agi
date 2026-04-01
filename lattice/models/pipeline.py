@@ -23,6 +23,7 @@ from ..data.arc_dataset import (
 from .slot_attention import SlotAttention
 from .vsa import DeltaExtractor, ConsensusBuilder, VSAOperations
 from .grid_decoder import SlotDecoder
+from .cross_attention_decoder import TransformationEncoder, CrossAttentionDecoder
 from .type_classifier import TransformationClassifier
 from .type_lattice import TypeLattice, MicroOpType
 from .library import TestTimeLibrary, LibraryEntry
@@ -68,8 +69,17 @@ class LatticeSolver(nn.Module):
             consistency_threshold=consistency_threshold,
         )
 
-        # Stage 5: Grid reconstruction
+        # Stage 5: Grid reconstruction (simple decoder, used during basic training)
         self.decoder = SlotDecoder(d_slot=d_slot, d_model=d_model)
+
+        # Stage 5b: Cross-attention decoder (uses demo pairs for transformation)
+        d_transform = d_slot * 2
+        self.transform_encoder = TransformationEncoder(
+            d_slot=d_slot, d_transform=d_transform,
+        )
+        self.cross_decoder = CrossAttentionDecoder(
+            d_slot=d_slot, d_transform=d_transform, d_model=d_transform,
+        )
 
         # Fallback: Type classification + lattice search
         self.type_classifier = TransformationClassifier(d_slot=d_slot)
@@ -134,6 +144,8 @@ class LatticeSolver(nn.Module):
         demo_types = []
         size_ratios = []  # track input→output size relationship
 
+        demo_pair_encodings = []  # for cross-attention decoder
+
         for pair in task.train:
             # Encode input and output grids
             in_slots, in_attn, in_h, in_w = self._encode_grid(pair.input, device)
@@ -141,6 +153,10 @@ class LatticeSolver(nn.Module):
 
             # Track size relationship for output size inference
             size_ratios.append((out_h / in_h, out_w / in_w))
+
+            # Encode transformation from this demo pair
+            pair_encoding = self.transform_encoder.encode_pair(in_slots, out_slots)
+            demo_pair_encodings.append(pair_encoding)
 
             # Extract delta
             delta, in_vsa = self.delta_extractor(in_slots, out_slots)
@@ -164,6 +180,9 @@ class LatticeSolver(nn.Module):
         h_ratio = h_ratios[0] if len(set(h_ratios)) == 1 else 1.0
         w_ratio = w_ratios[0] if len(set(w_ratios)) == 1 else 1.0
 
+        # --- Build aggregated transformation embedding ---
+        transform_embed = self.transform_encoder(demo_pair_encodings)
+
         # --- Solve each test input ---
         predictions = []
 
@@ -178,15 +197,10 @@ class LatticeSolver(nn.Module):
             out_w = max(1, int(round(test_w * w_ratio)))
 
             if is_consistent:
-                # Primary path: apply consensus delta
-                predicted_vsa = self.vsa_ops.bind(
-                    test_vsa.squeeze(0),
-                    consensus.unsqueeze(0).expand_as(test_vsa.squeeze(0)),
-                )
-                # Decode via attention-weighted slot mixing
-                pred_grid = self._decode_from_consensus(
-                    test_slots, test_attn, consensus, out_h, out_w, device
-                )
+                # Primary path: cross-attention decoder conditioned on transformation
+                pred_grid = self.cross_decoder.decode_grid(
+                    test_slots, transform_embed, test_attn, out_h, out_w,
+                ).squeeze(0)
             else:
                 # Fallback: type lattice search
                 pred_grid = self._solve_with_lattice(

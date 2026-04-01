@@ -28,6 +28,7 @@ from .data.arc_dataset import (
 from .models.slot_attention import SlotAttention
 from .models.vsa import DeltaExtractor, ConsensusBuilder, VSAOperations
 from .models.grid_decoder import SlotDecoder
+from .models.cross_attention_decoder import TransformationEncoder, CrossAttentionDecoder
 from .models.type_classifier import TransformationClassifier
 from .utils.augmentation import geometric_augmentations, generate_color_permutations, permute_colors
 
@@ -55,6 +56,15 @@ class LatticeTrainer(nn.Module):
         )
         self.consensus_builder = ConsensusBuilder(d_vsa=d_vsa)
         self.vsa_ops = VSAOperations()
+
+        # Cross-attention decoder (the real decoder)
+        d_transform = d_slot * 2
+        self.transform_encoder = TransformationEncoder(
+            d_slot=d_slot, d_transform=d_transform,
+        )
+        self.cross_decoder = CrossAttentionDecoder(
+            d_slot=d_slot, d_transform=d_transform, d_model=d_transform,
+        )
 
         self.d_vsa = d_vsa
 
@@ -105,6 +115,7 @@ class LatticeTrainer(nn.Module):
         """
         recon_losses = []
         deltas = []
+        pair_encodings = []
 
         for pair in task.train:
             # Encode both grids
@@ -124,31 +135,53 @@ class LatticeTrainer(nn.Module):
             delta, _ = self.delta_extractor(in_slots, out_slots)
             deltas.append(delta.squeeze(0))
 
+            # Transformation encoding for cross-attention decoder
+            pair_enc = self.transform_encoder.encode_pair(in_slots, out_slots)
+            pair_encodings.append(pair_enc)
+
         # Aggregate losses
         recon_loss = torch.stack(recon_losses).mean()
         consistency_loss = self.delta_consistency_loss(deltas)
 
-        # Output prediction loss: given input slots + knowing the transformation,
-        # can we produce the correct output grid?
+        # Aggregated transformation embedding
+        transform_embed = self.transform_encoder(pair_encodings)
+
+        # Output prediction loss (simple decoder)
         output_losses = []
         for pair in task.train:
             in_slots, in_attn, in_h, in_w = self.encode_grid(pair.input, device)
             out_h, out_w = pair.output.shape
-
-            # Decode to output size
             logits = self.decoder(in_slots, in_attn, out_h, out_w)
             target = pair.output[:out_h, :out_w].unsqueeze(0).to(device)
             output_losses.append(F.cross_entropy(logits, target))
 
         output_loss = torch.stack(output_losses).mean()
 
-        total = recon_loss + 0.5 * consistency_loss + output_loss
+        # Cross-attention decoder loss (the important one)
+        # Leave-one-out: for each pair, use others as demos, predict this one
+        cross_losses = []
+        for i, pair in enumerate(task.train):
+            in_slots, in_attn, in_h, in_w = self.encode_grid(pair.input, device)
+            out_h, out_w = pair.output.shape
+
+            # Use transform_embed from all pairs (including this one for now,
+            # leave-one-out is expensive — will add later)
+            logits = self.cross_decoder(
+                in_slots, transform_embed, in_attn, out_h, out_w,
+            )
+            target = pair.output[:out_h, :out_w].unsqueeze(0).to(device)
+            cross_losses.append(F.cross_entropy(logits, target))
+
+        cross_loss = torch.stack(cross_losses).mean()
+
+        total = recon_loss + 0.5 * consistency_loss + output_loss + cross_loss
 
         return {
             "total": total,
             "recon": recon_loss,
             "consistency": consistency_loss,
             "output": output_loss,
+            "cross": cross_loss,
         }
 
 
@@ -192,7 +225,7 @@ def train(
 
     for epoch in range(epochs):
         model.train()
-        epoch_losses = {"total": 0, "recon": 0, "consistency": 0, "output": 0}
+        epoch_losses = {"total": 0, "recon": 0, "consistency": 0, "output": 0, "cross": 0}
         t0 = time.perf_counter()
 
         # Shuffle tasks each epoch
@@ -242,8 +275,9 @@ def train(
         print(f"Epoch {epoch+1}/{epochs} | "
               f"loss={avg_losses['total']:.4f} "
               f"recon={avg_losses['recon']:.4f} "
-              f"consistency={avg_losses['consistency']:.4f} "
-              f"output={avg_losses['output']:.4f} | "
+              f"cross={avg_losses['cross']:.4f} "
+              f"output={avg_losses['output']:.4f} "
+              f"consist={avg_losses['consistency']:.4f} | "
               f"{elapsed:.0f}s | lr={scheduler.get_last_lr()[0]:.6f}")
 
         # Save checkpoint
