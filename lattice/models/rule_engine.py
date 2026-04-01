@@ -458,6 +458,8 @@ def detect_sort_rows(task: ARCTask) -> Optional[Rule]:
 
 # --- Main engine ---
 
+from .object_rules import OBJECT_DETECTORS
+
 ALL_DETECTORS = [
     detect_identity,
     detect_tiling,
@@ -473,7 +475,7 @@ ALL_DETECTORS = [
     detect_border,
     detect_max_object,
     detect_sort_rows,
-]
+] + OBJECT_DETECTORS
 
 
 class RuleEngine:
