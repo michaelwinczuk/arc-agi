@@ -19,3 +19,6 @@
 [submodule "external/TinyRecursiveModels"]
 	path = external/TinyRecursiveModels
 	url = https://github.com/SamsungSAILMontreal/TinyRecursiveModels
+[submodule "data/ARC-AGI-2"]
+	path = data/ARC-AGI-2
+	url = https://github.com/arcprize/ARC-AGI-2.git
